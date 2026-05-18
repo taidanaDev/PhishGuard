@@ -1,0 +1,55 @@
+@import url("https://fonts.googleapis.com/css2?family=Handjet:wght@400;500;600;700;800&display=swap");
+
+:root {
+  --bg-main: #07162F;
+  --bg-secondary: #0D2548;
+  --bg-card: #132F57;
+  --primary: #3B82F6;
+  --primary-light: #A7D8FF;
+  --text-main: #F4F8FF;
+  --text-muted: #9CB3D1;
+  --safe: #35D66B;
+  --suspicious: #FFD447;
+  --fake: #EF4444;
+  --border-dark: #031026;
+
+  color: var(--text-main);
+  background: var(--bg-main);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: "Handjet", sans-serif;
+}
+
+html {
+  background: var(--bg-main);
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--bg-main);
+  color: var(--text-main);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+#root {
+  min-height: 100vh;
+}
