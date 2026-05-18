@@ -1,7 +1,6 @@
 """
 PhishGuard Backend API
-A phishing URL detection service powered by a TF-IDF + LinearSVC ML model
-trained on the PhiUSIIL Phishing URL Dataset (235,795 URLs).
+A phishing URL detection service powered by a trained URL feature model.
 """
 
 import json
@@ -11,22 +10,20 @@ import time
 import warnings
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import joblib
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-# Suppress sklearn version mismatch warnings
 warnings.filterwarnings("ignore", category=UserWarning)
-
-# ── App Setup ─────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="PhishGuard API",
-    description="Phishing URL detection API using ML (PhiUSIIL Dataset)",
+    description="Phishing URL detection API using ML URL features",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -34,54 +31,62 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Frontend team: restrict this to your domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Model Loading ──────────────────────────────────────────────────────────────
-
 BASE_DIR = Path(__file__).parent
 MODEL_PATH = BASE_DIR / "model.pkl"
+FEATURE_COLUMNS_PATH = BASE_DIR / "feature_columns.pkl"
+LABEL_ENCODER_PATH = BASE_DIR / "label_encoder.pkl"
 METRICS_PATH = BASE_DIR / "metrics.json"
 
 model = None
+feature_columns = None
+label_encoder = None
 model_lock = threading.Lock()
 
-with open(METRICS_PATH, "r") as f:
-    model_metrics = json.load(f)
+if METRICS_PATH.exists():
+    with open(METRICS_PATH, "r") as f:
+        model_metrics = json.load(f)
+else:
+    model_metrics = {}
 
-# Label encoding: 0 = Phishing, 1 = Legitimate
-LABEL_MAP = {0: "phishing", 1: "legitimate"}
 
+def load_artifacts():
+    """Load model artifacts once, on first use."""
+    global model, feature_columns, label_encoder
 
-def get_model():
-    """Load the ML model once, on the first prediction request."""
-    global model
-
-    if model is not None:
-        return model
+    if model is not None and feature_columns is not None and label_encoder is not None:
+        return model, feature_columns, label_encoder
 
     with model_lock:
-        if model is not None:
-            return model
+        if model is not None and feature_columns is not None and label_encoder is not None:
+            return model, feature_columns, label_encoder
 
-        if not MODEL_PATH.exists():
-            raise HTTPException(status_code=500, detail=f"Model file not found: {MODEL_PATH}")
+        missing = [
+            str(path)
+            for path in (MODEL_PATH, FEATURE_COLUMNS_PATH, LABEL_ENCODER_PATH)
+            if not path.exists()
+        ]
+        if missing:
+            raise HTTPException(status_code=500, detail=f"Missing model artifacts: {', '.join(missing)}")
 
-        print(f"Loading ML model from {MODEL_PATH}...", flush=True)
+        print("Loading ML artifacts...", flush=True)
         start = time.perf_counter()
         try:
             model = joblib.load(MODEL_PATH)
+            feature_columns = joblib.load(FEATURE_COLUMNS_PATH)
+            label_encoder = joblib.load(LABEL_ENCODER_PATH)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Model load failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Model artifact load failed: {str(e)}")
 
         elapsed = round(time.perf_counter() - start, 2)
-        print(f"Model loaded successfully in {elapsed}s.", flush=True)
-        return model
+        print(f"ML artifacts loaded successfully in {elapsed}s.", flush=True)
+        return model, feature_columns, label_encoder
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def extract_url_features(url: str) -> dict:
     """Extract human-readable features from a URL for the response payload."""
@@ -89,20 +94,18 @@ def extract_url_features(url: str) -> dict:
         parsed = urlparse(url)
         domain = parsed.netloc or parsed.path
         path = parsed.path
-        query = parsed.query
-
-        has_ip = bool(
-            re.match(r"^\d{1,3}(\.\d{1,3}){3}(:\d+)?$", domain)
-        )
-        subdomain_count = max(0, len(domain.split(".")) - 2)
         tld = domain.split(".")[-1] if "." in domain else ""
-        suspicious_tlds = {"xyz", "tk", "ml", "gq", "cf", "ga", "pw", "cc", "top", "ru"}
+
+        has_ip = bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}(:\d+)?$", domain))
+        subdomain_count = max(0, len(domain.split(".")) - 2)
+        suspicious_tlds = {"xyz", "tk", "ml", "gq", "cf", "ga", "pw", "cc", "top", "ru", "xwq"}
+        common_tlds = {"com", "org", "net", "edu", "gov", "mil", "io", "co", "us", "uk", "ph", "dev", "app", "ai"}
         special_chars = len(re.findall(r"[@=?&%#~;]", url))
 
         flags = []
         if has_ip:
             flags.append("IP address used as domain")
-        if not parsed.scheme == "https":
+        if parsed.scheme != "https":
             flags.append("Not using HTTPS")
         if subdomain_count > 2:
             flags.append(f"Excessive subdomains ({subdomain_count})")
@@ -134,18 +137,119 @@ def extract_url_features(url: str) -> dict:
         return {}
 
 
-def get_risk_level(phishing_prob: float) -> str:
-    if phishing_prob >= 0.80:
+def extract_model_features(url: str) -> dict:
+    """Extract the 18 feature columns used by the retrained random forest."""
+    parsed = urlparse(url)
+    domain = parsed.netloc or parsed.path
+    decoded_url = unquote(url)
+
+    url_len = len(url)
+    domain_len = len(domain)
+    has_ip = int(bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}(:\d+)?$", domain)))
+    tld = domain.split(".")[-1] if "." in domain else ""
+    subdomain_count = max(0, len(domain.split(".")) - 2)
+
+    obfuscated_chars = len(re.findall(r"%[0-9a-fA-F]{2}", url))
+    has_obfuscation = int(obfuscated_chars > 0 or decoded_url != url)
+    letters = len(re.findall(r"[A-Za-z]", url))
+    digits = len(re.findall(r"\d", url))
+    other_special_chars = len(re.findall(r"[^A-Za-z0-9]", url))
+
+    return {
+        "URLLength": url_len,
+        "DomainLength": domain_len,
+        "IsDomainIP": has_ip,
+        "TLDLength": len(tld),
+        "NoOfSubDomain": subdomain_count,
+        "HasObfuscation": has_obfuscation,
+        "NoOfObfuscatedChar": obfuscated_chars,
+        "ObfuscationRatio": obfuscated_chars / url_len if url_len else 0,
+        "NoOfLettersInURL": letters,
+        "LetterRatioInURL": letters / url_len if url_len else 0,
+        "NoOfDegitsInURL": digits,
+        "DegitRatioInURL": digits / url_len if url_len else 0,
+        "NoOfEqualsInURL": url.count("="),
+        "NoOfQMarkInURL": url.count("?"),
+        "NoOfAmpersandInURL": url.count("&"),
+        "NoOfOtherSpecialCharsInURL": other_special_chars,
+        "SpacialCharRatioInURL": other_special_chars / url_len if url_len else 0,
+        "IsHTTPS": int(parsed.scheme == "https"),
+    }
+
+
+def build_feature_frame(urls: list[str], columns: list[str]) -> pd.DataFrame:
+    rows = [extract_model_features(url) for url in urls]
+    return pd.DataFrame(rows).reindex(columns=columns, fill_value=0)
+
+
+def get_label_probabilities(clf, encoder, proba_row):
+    class_to_probability = {
+        encoder.inverse_transform([int(class_value)])[0]: float(proba_row[index])
+        for index, class_value in enumerate(clf.classes_)
+    }
+    fake_prob = class_to_probability.get("fake", 0.0)
+    safe_prob = class_to_probability.get("safe", 0.0)
+    return fake_prob, safe_prob
+
+
+def get_risk_level(fake_prob: float) -> str:
+    if fake_prob >= 0.80:
         return "high"
-    elif phishing_prob >= 0.50:
+    if fake_prob >= 0.50:
         return "medium"
-    elif phishing_prob >= 0.25:
+    if fake_prob >= 0.25:
         return "low"
-    else:
-        return "safe"
+    return "safe"
 
 
-# ── Request / Response Schemas ─────────────────────────────────────────────────
+
+
+def get_rule_fake_probability(url: str, features: dict) -> float:
+    """Conservative URL rule score used as a guardrail around the model."""
+    flags = set(features.get("suspicious_flags", []))
+    score = 0.0
+
+    if features.get("has_ip_address"):
+        score += 0.35
+    if not features.get("has_https"):
+        score += 0.20
+    if any(flag.startswith("Suspicious TLD") for flag in flags):
+        score += 0.35
+    if any(flag.startswith("Uncommon TLD") for flag in flags):
+        score += 0.25
+    if "Contains sensitive keywords" in flags:
+        score += 0.30
+    if "Contains @ symbol (redirect trick)" in flags:
+        score += 0.35
+    if any(flag.startswith("Excessive subdomains") for flag in flags):
+        score += 0.20
+    if any(flag.startswith("Unusually long URL") for flag in flags):
+        score += 0.15
+    if any(flag.startswith("Many special characters") for flag in flags):
+        score += 0.15
+
+    sensitive_hits = re.findall(
+        r"(login|verify|secure|account|update|confirm|bank|paypal|signin|password|credential|wallet|prize|gift|free|limited|urgent)",
+        url,
+        re.I,
+    )
+    if len(sensitive_hits) >= 3:
+        score += 0.30
+    elif re.search(r"(password|credential|wallet|prize|gift|free|limited|urgent)", url, re.I):
+        score += 0.15
+
+    if re.search(r"(paypal|google|microsoft|apple|facebook|bank)", url, re.I) and any(
+        flag.startswith(("Suspicious TLD", "Uncommon TLD")) for flag in flags
+    ):
+        score += 0.20
+
+    return min(score, 1.0)
+def normalize_url(url: str) -> str:
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
 
 class URLCheckRequest(BaseModel):
     url: str
@@ -158,10 +262,7 @@ class URLCheckRequest(BaseModel):
             raise ValueError("URL must not be empty.")
         if len(v) > 2048:
             raise ValueError("URL is too long (max 2048 characters).")
-        # Auto-prepend scheme if missing
-        if not v.startswith(("http://", "https://")):
-            v = "http://" + v
-        return v
+        return normalize_url(v)
 
 
 class BulkURLCheckRequest(BaseModel):
@@ -177,16 +278,13 @@ class BulkURLCheckRequest(BaseModel):
         return v
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
-
 @app.get("/", tags=["Health"])
 def root():
     return {
         "service": "PhishGuard API",
         "status": "running",
         "version": "1.0.0",
-        "model": model_metrics.get("best_model"),
-        "trained_at": model_metrics.get("trained_at"),
+        "model": model_metrics.get("best_model", "random_forest_url_features"),
         "docs": "/docs",
     }
 
@@ -202,69 +300,55 @@ def health():
 
 @app.get("/model/info", tags=["Model"])
 def model_info():
-    """Returns metadata about the loaded ML model and its performance metrics."""
-    best = model_metrics.get("best_model", "tfidf_linearsvc_calibrated")
-    best_metrics = model_metrics.get("models", {}).get(best, {})
     return {
-        "best_model": best,
+        "best_model": model_metrics.get("best_model", "random_forest_url_features"),
         "trained_at": model_metrics.get("trained_at"),
         "dataset": model_metrics.get("dataset"),
-        "performance": {
-            "accuracy": best_metrics.get("accuracy"),
-            "precision": best_metrics.get("precision"),
-            "recall": best_metrics.get("recall"),
-            "f1_score": best_metrics.get("f1"),
-            "roc_auc": best_metrics.get("roc_auc"),
-        },
-        "all_models": {
-            name: {
-                "accuracy": m.get("accuracy"),
-                "f1_score": m.get("f1"),
-                "roc_auc": m.get("roc_auc"),
-            }
-            for name, m in model_metrics.get("models", {}).items()
-        },
+        "labels": ["fake", "safe"],
+        "feature_columns": feature_columns if feature_columns is not None else None,
     }
 
 
 @app.post("/predict", tags=["Prediction"])
 def predict_url(request: URLCheckRequest):
-    """
-    Analyze a single URL for phishing.
-
-    Returns a prediction (legitimate / phishing), confidence scores,
-    risk level, and a breakdown of suspicious URL features.
-    """
     url = request.url
     start = time.perf_counter()
 
     try:
-        clf = get_model()
-        proba = clf.predict_proba([url])[0]
-        pred_label = clf.predict([url])[0]
+        clf, columns, encoder = load_artifacts()
+        feature_frame = build_feature_frame([url], columns)
+        proba = clf.predict_proba(feature_frame)[0]
+        encoded_label = int(clf.predict(feature_frame)[0])
+        decoded_label = encoder.inverse_transform([encoded_label])[0]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model prediction failed: {str(e)}")
 
     elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
-
-    phishing_prob = float(proba[0])   # class 0 = phishing
-    legit_prob = float(proba[1])       # class 1 = legitimate
-    prediction = LABEL_MAP[int(pred_label)]
-    risk = get_risk_level(phishing_prob)
+    fake_prob, safe_prob = get_label_probabilities(clf, encoder, proba)
     features = extract_url_features(url)
+    rule_fake_prob = get_rule_fake_probability(url, features)
+    fake_prob = max(fake_prob, rule_fake_prob)
+    safe_prob = min(safe_prob, 1.0 - fake_prob)
+    is_fake = decoded_label == "fake" or fake_prob >= 0.80
 
     return {
         "url": url,
-        "prediction": prediction,
-        "is_phishing": prediction == "phishing",
-        "risk_level": risk,
+        "prediction": "phishing" if is_fake else "legitimate",
+        "label": decoded_label,
+        "is_phishing": is_fake,
+        "risk_level": get_risk_level(fake_prob),
         "confidence": {
-            "phishing": round(phishing_prob, 6),
-            "legitimate": round(legit_prob, 6),
+            "phishing": round(fake_prob, 6),
+            "legitimate": round(safe_prob, 6),
+            "fake": round(fake_prob, 6),
+            "safe": round(safe_prob, 6),
         },
         "url_features": features,
+        "model_features": extract_model_features(url),
         "meta": {
-            "model_used": model_metrics.get("best_model"),
+            "model_used": model_metrics.get("best_model", "random_forest_url_features"),
             "inference_time_ms": elapsed_ms,
             "analyzed_at": datetime.utcnow().isoformat() + "Z",
         },
@@ -273,67 +357,63 @@ def predict_url(request: URLCheckRequest):
 
 @app.post("/predict/bulk", tags=["Prediction"])
 def predict_bulk(request: BulkURLCheckRequest):
-    """
-    Analyze up to 50 URLs in one request.
-
-    Returns predictions for each URL plus an overall summary.
-    """
-    urls = request.urls
-    # Normalize URLs
-    normalized = []
-    for u in urls:
-        u = u.strip()
-        if not u.startswith(("http://", "https://")):
-            u = "http://" + u
-        normalized.append(u)
-
+    normalized = [normalize_url(url) for url in request.urls]
     start = time.perf_counter()
+
     try:
-        clf = get_model()
-        probas = clf.predict_proba(normalized)
-        preds = clf.predict(normalized)
+        clf, columns, encoder = load_artifacts()
+        feature_frame = build_feature_frame(normalized, columns)
+        probas = clf.predict_proba(feature_frame)
+        encoded_preds = clf.predict(feature_frame)
+        decoded_preds = encoder.inverse_transform(encoded_preds.astype(int))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Bulk prediction failed: {str(e)}")
 
     elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
-
     results = []
-    phishing_count = 0
+    fake_count = 0
+
     for i, url in enumerate(normalized):
-        phishing_prob = float(probas[i][0])
-        legit_prob = float(probas[i][1])
-        prediction = LABEL_MAP[int(preds[i])]
-        if prediction == "phishing":
-            phishing_count += 1
+        fake_prob, safe_prob = get_label_probabilities(clf, encoder, probas[i])
+        features = extract_url_features(url)
+        rule_fake_prob = get_rule_fake_probability(url, features)
+        fake_prob = max(fake_prob, rule_fake_prob)
+        safe_prob = min(safe_prob, 1.0 - fake_prob)
+        is_fake = decoded_preds[i] == "fake" or fake_prob >= 0.80
+        if is_fake:
+            fake_count += 1
 
         results.append({
             "url": url,
-            "prediction": prediction,
-            "is_phishing": prediction == "phishing",
-            "risk_level": get_risk_level(phishing_prob),
+            "prediction": "phishing" if is_fake else "legitimate",
+            "label": decoded_preds[i],
+            "is_phishing": is_fake,
+            "risk_level": get_risk_level(fake_prob),
             "confidence": {
-                "phishing": round(phishing_prob, 6),
-                "legitimate": round(legit_prob, 6),
+                "phishing": round(fake_prob, 6),
+                "legitimate": round(safe_prob, 6),
+                "fake": round(fake_prob, 6),
+                "safe": round(safe_prob, 6),
             },
         })
 
     return {
         "results": results,
         "summary": {
-            "total": len(urls),
-            "phishing_detected": phishing_count,
-            "legitimate": len(urls) - phishing_count,
-            "phishing_rate": round(phishing_count / len(urls) * 100, 2),
+            "total": len(normalized),
+            "phishing_detected": fake_count,
+            "legitimate": len(normalized) - fake_count,
+            "phishing_rate": round(fake_count / len(normalized) * 100, 2),
         },
         "meta": {
-            "model_used": model_metrics.get("best_model"),
+            "model_used": model_metrics.get("best_model", "random_forest_url_features"),
             "inference_time_ms": elapsed_ms,
             "analyzed_at": datetime.utcnow().isoformat() + "Z",
         },
     }
 
-
-# ── Error Handlers ─────────────────────────────────────────────────────────────
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -349,3 +429,8 @@ async def generic_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"error": "Internal server error", "detail": str(exc)},
     )
+
+
+
+
+

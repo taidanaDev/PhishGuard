@@ -6,7 +6,7 @@ function Home() {
       <section className="hero">
         <div className="hero-copy">
           <p className="tag">PHISHGUARD SYSTEM</p>
-          <h1>Pixel-powered phishing URL detection.</h1>
+          <h1>AI-powered phishing URL detection.</h1>
           <p className="subtitle">
             Paste suspicious links and let PhishGuard check for phishing patterns before you open them.
           </p>

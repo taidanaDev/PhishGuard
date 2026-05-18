@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { scanUrl } from "../api/phishguardApi";
 import { saveScanResult } from "../utils/historyStorage";
+import fakeIcon from "../assets/status-fake.webp";
+import safeIcon from "../assets/status-safe.webp";
+import suspiciousIcon from "../assets/status-suspicious.webp";
 
 function formatPercent(value) {
   if (typeof value !== "number") {
@@ -8,6 +11,33 @@ function formatPercent(value) {
   }
 
   return `${Math.round(value * 100)}%`;
+}
+
+function getResultStatus(result) {
+  if (result?.is_phishing || result?.risk_level === "high") {
+    return {
+      label: "Fake",
+      className: "danger",
+      icon: fakeIcon,
+      title: "Phishing detected",
+    };
+  }
+
+  if (result?.risk_level && result.risk_level !== "safe") {
+    return {
+      label: "Suspicious",
+      className: "warning",
+      icon: suspiciousIcon,
+      title: "Suspicious link",
+    };
+  }
+
+  return {
+    label: "Safe",
+    className: "safe",
+    icon: safeIcon,
+    title: "Likely legitimate",
+  };
 }
 
 function Scan() {
@@ -40,7 +70,7 @@ function Scan() {
   }
 
   const flags = result?.url_features?.suspicious_flags || [];
-  const resultClass = result?.is_phishing ? "danger" : "safe";
+  const resultStatus = result ? getResultStatus(result) : null;
 
   return (
     <main className="app">
@@ -70,8 +100,21 @@ function Scan() {
       </section>
 
       {result && (
-        <section className={`result-card ${resultClass}`}>
-          <h2>{result.prediction === "phishing" ? "Phishing detected" : "Likely legitimate"}</h2>
+        <section className={`result-card ${resultStatus.className}`}>
+          <div className={`result-icon-panel ${resultStatus.className}`}>
+            <img
+              className="result-status-icon"
+              src={resultStatus.icon}
+              alt={`${resultStatus.label} result`}
+            />
+          </div>
+
+          <div className="result-title">
+            <h2>{resultStatus.title}</h2>
+            <span className={`status-badge ${resultStatus.className}`}>
+              {resultStatus.label}
+            </span>
+          </div>
           <p className="subtitle">{result.url}</p>
 
           <div className="result-grid">
@@ -121,3 +164,5 @@ function Scan() {
 }
 
 export default Scan;
+
+
